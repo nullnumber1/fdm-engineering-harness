@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Job-specific records and evidence belong to the adopting project.
+harness/runs/*
+!harness/runs/.gitkeep
+harness/evidence/*
+!harness/evidence/.gitkeep
+
+# Manufacturing artifacts are not part of this rules package.
+*.gcode
+*.3mf
+*.stl
+*.step
+*.stp

@@ -1,0 +1,3 @@
+interface:
+  display_name: "FDM инженерная проверка"
+  short_description: "Обязательная проверка конструкции деталей для FDM"
