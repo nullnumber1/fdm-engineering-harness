@@ -7,6 +7,20 @@ description: Prepare or change Bambu Lab A1 PETG slicing, profiles, custom G-cod
 
 Read the [engineering specification](../../../harness/ENGINEERING-SPEC-RU.md)
 and all slice checks in [the catalog](../../../harness/checks.json).
+Prepare the requested part for its full final function with `purpose: production`;
+a cold-fit or prototype label never relaxes dimensions, strength or process
+acceptance. Follow the specification's final-product section for missing data.
+Read the [surface-quality procedure](../../../harness/SUPPORTED-SURFACES-RU.md)
+for supported faces, bridges, model-edge curling and thin contours. Populate
+manufacturing_quality and pass supported-surface-quality,
+native-support-stability and free-edge-continuity on the exact job. Inspect
+each root and interface separately from the model edge above it. Qualify
+supported/bridge faces against their actual function and tolerance using the
+procedure's engineering justification or applicable physical results. Support
+formation alone does not require a new coupon. A remaining critical uncertainty
+still blocks the product part. A removable support, dense interface or four
+commanded layers alone does not prove a sound surface. Justify section adequacy
+and keep continuous material, forming bases and safe actual seams throughout.
 
 1. Require design PASS for production slicing. A slice investigating a blocked
    design stays diagnostic and cannot be released.
@@ -30,10 +44,21 @@ and all slice checks in [the catalog](../../../harness/checks.json).
    ordinary/bridge/overhang/first-layer cooling, layer time, speed, volumetric
    limit and distinct flow settings. Support every changed value with evidence;
    never invent universal PETG numbers.
+   Diagnose the mechanism before a substantial CAD correction. Compare local
+   interface/gap, bridge flow/width/direction, overlap, modifier boundaries,
+   seams, cooling and speed with reasonable orientations of accepted geometry.
+   Preserve applicable global flow calibration; more fan, slower printing and
+   100% infill are not automatic improvements. Record the hypothesis, actual
+   effective delta, result and acceptance margin. Validate suspicious parser
+   flags against real joint/line geometry and the method's uncertainty.
 5. Inspect the entire plate through height, including after short parts finish.
    Evaluate tall narrow parts and actual first-layer brim/contact paths. Skirt
    does not replace adhesion. Mixed heights need process compatibility review,
    not an automatic ban. For by-object check head/gantry clearance and sequence.
+   Compare relevant flat/edge candidates by total quality, rigidity, adhesion,
+   nozzle clearance, time and material. A rigid-body tipping calculation alone
+   does not prove adhesion or vibration safety. Show a consequential tall or
+   changed-shape choice early; no extra universal approval gate is added.
 6. Slice and inspect critical layers; export the exact project and sliced job.
    Bind exports to parts/plates. Reconcile actual objects, copies, coordinates
    and transforms with the declared inventory.
@@ -52,4 +77,7 @@ and all slice checks in [the catalog](../../../harness/checks.json).
 
 Use [existing auditors](../../../harness/EXISTING-CHECKS-RU.md) within their
 limits. Successful slicing does not prove strength, support removal, fit or
-adhesion.
+adhesion. Use equivalent feature groups where justified; do not create an
+exhaustive new auditor when a bounded verified method closes the actual risk.
+Continue authorized diagnosis while blocked and finish when the stated criteria
+pass, rather than continually adding optimization targets.

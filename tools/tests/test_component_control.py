@@ -59,7 +59,7 @@ class ComponentControlTests(unittest.TestCase):
                         "TEST ONLY synthetic fixture section")
 
     def test_new_run_initializes_unknown_control_and_cannot_claim_component_pass(self):
-        fresh = self.h.create("new-control-test", ["part"], ["plate"], "other-petg", "prototype")
+        fresh = self.h.create("new-control-test", ["part"], ["plate"], "other-petg", "production")
         self.assertEqual(fresh["component_control"], {
             "decision": "unknown", "register_artifact": None, "baseline_artifact": None,
             "comparison_artifact": None, "proposal_artifact": None, "reviews": [], "approval": None,

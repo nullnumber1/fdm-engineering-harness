@@ -6,6 +6,39 @@ all other PETG. The authoritative procedure is
 [harness/ENGINEERING-SPEC-RU.md](harness/ENGINEERING-SPEC-RU.md); the complete
 mandatory check catalog is [harness/checks.json](harness/checks.json).
 
+## Final product intent
+
+Every product part is designed and prepared for the finished assembly with
+`purpose: production`. Apply its full functional, assembly, strength and
+manufacturing-quality criteria at every relevant stage. An unknown critical
+requirement blocks that stage; renaming the part a prototype, cold-fit trial or
+experiment never lowers acceptance. `prototype` runs are historical records,
+not valid releases. Separate bounded calibration coupons establish missing
+process evidence under the specification; they do not replace the requested
+product part. Read the specification's final-product section before using one.
+
+## Engineering priorities and proportionate correction
+
+Meet the accepted product requirements: function, fit, strength, assembly,
+surface quality and a simple coherent design. Support count, bridge labels,
+infill percentage and analyzer flags are diagnostic means, not product goals.
+Use the specification's correction workflow before a substantial redesign:
+identify the actual failure, compare targeted native process settings and
+reasonable orientations with the accepted geometry, then justify any CAD delta
+by its total benefit. Do not remove supports at the cost of an unnecessarily
+tall flexible print, changed windows, extra mass or assembly complexity.
+Neither flat nor on-edge printing is mandatory; assess both where relevant.
+
+Preserve applicable calibrated global flow; tune local bridge/interface,
+cooling, speed, overlap or seam settings against the actual mechanism and
+effective toolpaths. Do not assume more fan, less speed or 100% infill is always
+better. Show consequential shape/orientation choices early. This is not a new
+approval gate; existing user scope, component approval and print authorization
+still apply. Validate suspicious analyzer results before changing the product.
+Cover all risk features, grouping genuinely equivalent ones; scale depth to
+consequence and uncertainty rather than demanding an exhaustive new experiment
+for every ordinary edge. Stop adding checks when the stated criteria are met.
+
 ## Before engineering work
 
 Before changing CAD code, dimensions, geometry, orientation, plate placement,
@@ -42,7 +75,8 @@ after fixes. They are not release candidates until the gates pass.
 
 - Complete every applicable check for **every part and every plate**, covering
   all identified loaded roots, fasteners, overhangs, bridges and support groups.
-  One representative feature or a global “looks good” is not assembly coverage.
+  Equivalent features may share evidence if all members and the equivalence
+  basis are explicit. A global “looks good” is not assembly coverage.
 - PASS requires an observation, actor, method and current file evidence with a
   locator. N/A requires proof and catalog permission. FAIL, UNKNOWN, missing or
   stale records block advancement and release.
@@ -117,6 +151,25 @@ functional ribs distinct from temporary printing aids. Apply the mandatory
 `native-supports-only` check to every part; see the specification for evidence
 and failure handling. Prototypes and diagnostic work have no exemption.
 
+## Supported surfaces, model curl and complete edges
+
+Before choosing geometry/orientation, preparing supports/bridges or releasing a
+job, read [the surface-quality procedure](harness/SUPPORTED-SURFACES-RU.md).
+Complete `manufacturing_quality` for every part/plate. Apply
+`surface-quality-strategy`, `supported-surface-quality`,
+`native-support-stability` and `free-edge-continuity` with current evidence.
+Support removability and nominal CAD thickness do not establish a sound printed
+surface. Inspect support roots **and the model edge over the interface** for
+curl/collision, and every functional/free edge for continuous material, forming
+base and safe seams. Qualify against its actual acceptance criteria using
+current engineering evidence or applicable physical results; bridge/support
+formation alone does not require a new physical coupon. Explain section
+adequacy by function; three roads/four layers remain the fallback for thin
+features without a specific justified criterion. Unknown critical quality
+still blocks the product part. Obtain missing physical evidence only when
+needed, using an applicable existing part or a separately bounded `calibration`
+coupon. Keep the native-supports-only rule.
+
 ## Custom G-code and modal state
 
 Before editing or accepting custom G-code in profiles, project macros or exported
@@ -141,12 +194,14 @@ and harness tests may use failed jobs; never release them through an exception.
 ## Print release
 
 Report the exact run, final job, passed gate and physical validation limits.
-Ready to print is separate from proven fit, strength, heat resistance or service
-life; retain prototype/calibration labels. Historical audits are not automatic
-approval of existing files.
+Ready to print is separate from completed post-manufacturing inspection and
+service validation. Record pending physical checks honestly without downgrading
+product requirements or releasing a known critical unknown. Preserve historical
+prototype records as history; labels, renamed runs and old audits grant no
+current approval of existing files.
 
 Release PASS alone does not authorize a physical print. Obtain authorization
 for the exact job and confirm the physical bed/material state before using
-signed Bambu Studio. Do not enable unsigned SDK senders or bypass SDK signatures.
-This package includes no printer transport. This harness supplies mandatory agent rules and
+signed Bambu Studio. Do not enable unsigned SDK senders or bypass SDK signatures. This package
+includes no printer transport. This harness supplies mandatory agent rules and
 local review/file gates, not an OS sandbox or a lock on the user's Studio UI.

@@ -15,6 +15,42 @@ SYNTHETIC_GCODE = ("; SYNTHETIC TEST FIXTURE ONLY; NO ACTUAL PRINT\n"
                    "G90\nM83\n; CHANGE_LAYER\nG1 X1 Y1 E.1\n; EXECUTABLE_BLOCK_END\n")
 
 
+def install_synthetic_quality(run, harness):
+    """Fictional observations exercise schemas; they are never actual evidence."""
+    def ref(key):
+        return {"artifact": key, "sha256": run["artifacts"][key]["sha256"],
+                "locator": "TEST ONLY: fictional measured feature and exact layer range"}
+
+    def observed():
+        return {"result": "accepted", "observation": "TEST ONLY fictional physical observation; no real manufacturing claim",
+                "evidence": ref("proof")}
+
+    surface = {"id": "supported-lip", "class": "functional", "formation": "native-support",
+               "acceptance": "TEST ONLY fictional no-holes and flatness criterion", "area_mm2": 500.0,
+               "max_span_mm": 15.0, "strategy": "physically-validated", "evidence": ref("proof"),
+               "slice": {"first_model_z_mm": 10.0, "unsupported_span_mm": 0.5,
+                         "interface_gap_mm": 0.2, "interface_pitch_mm": 0.5,
+                         "anchoring": "TEST ONLY fictional two-sided anchoring",
+                         "line_direction": "TEST ONLY fictional short direction",
+                         "edge_formation": "TEST ONLY fictional continuous formed edge", "evidence": ref("proof")},
+               "physical_validation": {"source": "physical-test", "result": "accepted",
+                   "test_actor": "SYNTHETIC FICTIONAL TESTER", "sample_id": "SYNTHETIC-SAMPLE-ONLY",
+                   "observed_at": "SYNTHETIC TIME ONLY", "material_condition": "TEST ONLY fictional dry material condition",
+                   "process_signature": harness.quality_process_signature(run), "test_kind": "representative-coupon",
+                   "equivalence": "TEST ONLY fictional matching geometry, orientation, span and forming edge",
+                   "geometry_evidence": ref("mesh"), "project_equivalence_evidence": ref("proof"),
+                   "criteria": {k: observed() for k in ("surface-finish", "dimensional-integrity", "layer-bonding", "edge-curl", "removability")}}}
+    edge = {"id": "lip-edge", "kind": "mixed", "layer_start": 10, "layer_end": 20,
+            "min_roads": 3, "min_layers": 4, "forming_base": "native-support", "continuous": True,
+            "seam_safe": True, "base_supported": True, "evidence": ref("proof"),
+            "observation": "TEST ONLY fictional continuous roads, forming base and safe seam at all edge layers"}
+    group = {"id": "normal-group", "part_id": "bracket", "surface_ids": ["supported-lip"],
+             **{k: observed() for k in ("root_stability", "interface_coverage", "model_edge_curl", "nozzle_collision", "removal_access")}}
+    run["manufacturing_quality"] = {"schema_version": 1, "calibration_scope": None,
+        "parts": {"bracket": {"inventory_evidence": ref("proof"), "surfaces": [surface], "edges": [edge]}},
+        "plates": {"plate01": {"inventory_evidence": ref("proof"), "has_supports": True, "support_groups": [group]}}}
+
+
 class EngineeringHarnessTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -26,7 +62,7 @@ class EngineeringHarnessTests(unittest.TestCase):
             p.write_bytes((REPO / name).read_bytes())
         self.h = eh.Harness(self.root)
         self.run = self.h.create("test-only", ["bracket"], ["plate01"],
-                                 "bambu-petg-basic", "prototype")
+                                 "bambu-petg-basic", "production")
         for key, role, suffix in (
             ("source", "source", ".py"), ("mesh", "geometry", ".stl"),
             ("machine", "machine-profile", ".json"), ("filament", "filament-profile", ".json"),
@@ -53,6 +89,7 @@ class EngineeringHarnessTests(unittest.TestCase):
             "customization": "none", "expected_e_mode": "relative",
             "scope_artifact": "gcode-scope", "baseline_artifact": "gcode-baseline",
         }
+        install_synthetic_quality(self.run, self.h)
 
     def complete(self, run=None):
         run = self.run if run is None else run
@@ -67,6 +104,8 @@ class EngineeringHarnessTests(unittest.TestCase):
                 plate = run["plates"][target.split(":", 1)[1]]
                 evidence += [a for a in plate["artifacts"] if run["artifacts"][a]["role"] == "gcode"]
                 evidence += [plate["gcode_review"]["scope_artifact"], plate["gcode_review"]["baseline_artifact"]]
+            if c["id"] in eh.QUALITY_CHECKS:
+                evidence = ["proof", "mesh"] if c["stage"] == "design" else list(run["artifacts"])
             self.h.mark(run, c["id"], target, "PASS", "Synthetic fixture observation; not a real release",
                         "review-agent" if independent else run["owner"],
                         "independent-review" if independent else "inspection", evidence,
@@ -224,7 +263,7 @@ class EngineeringHarnessTests(unittest.TestCase):
         self.complete()
         self.run["profile"]["material"]["product"] = "Bambu PETG HF"
         self.assertFalse(self.h.validate(self.run, "intake")["passed"])
-        generic = self.h.create("generic-test", ["a"], ["one"], "other-petg", "prototype")
+        generic = self.h.create("generic-test", ["a"], ["one"], "other-petg", "production")
         self.assertEqual(generic["profile"]["material"]["variant"], "other-petg")
         self.assertEqual(generic["profile"]["material"]["manufacturer"], "unknown")
 
@@ -271,7 +310,7 @@ class EngineeringHarnessTests(unittest.TestCase):
         with self.assertRaises(eh.HarnessError):
             self.h.write_markdown("generated.md", self.h.catalog_markdown())
         self.assertEqual(path.read_bytes(), original)
-        other = self.h.create("other", ["a"], ["one"], "other-petg", "prototype")
+        other = self.h.create("other", ["a"], ["one"], "other-petg", "production")
         with self.assertRaises(eh.HarnessError):
             self.h.write_markdown("generated.md", self.h.catalog_markdown(), other)
 
