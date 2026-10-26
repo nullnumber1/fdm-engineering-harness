@@ -3,6 +3,8 @@
 Use a focused branch and open a pull request against `main`. Describe the
 concrete problem and resulting behavior, the evidence and compatibility impact.
 Use short imperative commit subjects consistent with the existing history.
+The project and contributions use the [MIT license](LICENSE); retain applicable
+copyright and license notices.
 
 ## Scope
 

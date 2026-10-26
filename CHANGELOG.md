@@ -15,6 +15,7 @@ Changes are grouped by publication date. No versioned release is declared yet.
 
 ### Added
 
+- MIT license, selected explicitly by the repository owner.
 - `SUPPORTED-SURFACES-RU.md`, structured quality/purpose regressions, engineering rationale and migration instructions.
 - Contributor and pull-request guidance; CI covers Python 3.9, 3.11 and 3.13 with pinned action revisions.
 
