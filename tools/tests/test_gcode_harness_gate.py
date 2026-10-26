@@ -45,7 +45,7 @@ class GcodeHarnessGateTests(unittest.TestCase):
                 + "G1 X2 Y2 E.1 F1000\n; EXECUTABLE_BLOCK_END\n")
 
     def test_new_plate_defaults_to_unknown_and_check_is_mandatory(self):
-        fresh = self.h.create("new-gcode-test", ["part"], ["plate"], "other-petg", "prototype")
+        fresh = self.h.create("new-gcode-test", ["part"], ["plate"], "other-petg", "production")
         self.assertEqual(fresh["plates"]["plate"]["gcode_review"], {
             "customization": "unknown", "expected_e_mode": None,
             "scope_artifact": None, "baseline_artifact": None,

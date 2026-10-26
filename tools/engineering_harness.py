@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -19,6 +20,7 @@ from typing import Any
 from zipfile import BadZipFile, ZipFile
 
 STAGES = ("intake", "design", "slice", "release")
+PURPOSES = ("production", "calibration")
 STATUSES = ("UNKNOWN", "PASS", "FAIL", "N/A")
 ROLES = {
     "source": 0, "measurement": 0, "machine-profile": 0,
@@ -36,8 +38,11 @@ COMPONENT_CHECKS = {
 COMPONENT_REVIEW_KINDS = (
     "technical-necessity", "preserve-current-alternatives", "independent-feasibility",
 )
+QUALITY_CHECKS = {"surface-quality-strategy", "supported-surface-quality",
+                  "native-support-stability", "free-edge-continuity"}
 POLICY_FILES = (
     "AGENTS.md", "harness/checks.json", "harness/ENGINEERING-SPEC-RU.md",
+    "harness/SUPPORTED-SURFACES-RU.md",
     "harness/GCODE-MODIFICATION-RU.md",
     ".agents/skills/fdm-design/SKILL.md",
     ".agents/skills/bambu-petg-preparation/SKILL.md",
@@ -189,8 +194,10 @@ class Harness:
             errors.append("Unsupported run schema")
         if not text_present(run.get("run_id")) or not text_present(run.get("owner")):
             errors.append("run_id and owner are required")
-        if run.get("purpose") not in {"production", "prototype", "calibration"}:
-            errors.append("Explicit purpose required: production/prototype/calibration")
+        # Legacy records remain readable and diagnosable; accepting their schema
+        # does not permit creating or passing a prototype run under current policy.
+        if run.get("purpose") not in (*PURPOSES, "prototype"):
+            errors.append("Explicit purpose required: production/calibration")
         for name in ("artifacts", "parts", "plates"):
             v = run.get(name)
             if not isinstance(v, dict):
@@ -203,6 +210,8 @@ class Harness:
                     errors.append(f"Invalid {name} entry: {key}")
         if not isinstance(run.get("checks"), list):
             errors.append("checks must be an array")
+        if run.get("manufacturing_quality") is not None and not isinstance(run["manufacturing_quality"], dict):
+            errors.append("manufacturing_quality must be an object when declared")
         control = run.get("component_control")
         required_control = {"decision", "register_artifact", "baseline_artifact", "comparison_artifact",
                             "proposal_artifact", "reviews", "approval"}
@@ -373,6 +382,8 @@ class Harness:
 
     def basis(self, run: dict, stage: str) -> str:
         limit = STAGES.index(stage)
+        quality = run.get("manufacturing_quality")
+        quality_scope = quality.get("calibration_scope") if isinstance(quality, dict) else quality
         subject = {key: item for key, item in run["artifacts"].items()
                    if ROLES.get(item["role"]) is not None and ROLES[item["role"]] <= limit}
         parts = {key: (item if limit >= 1 else {}) for key, item in run["parts"].items()}
@@ -382,7 +393,460 @@ class Harness:
                             "purpose": run["purpose"], "owner": run["owner"],
                             "profile": run["profile"], "artifacts": subject,
                             "parts": parts, "plates": plates,
-                            "component_control": run["component_control"]})
+                            "component_control": run["component_control"],
+                            "manufacturing_quality": quality if limit >= 1 else quality_scope})
+
+    @staticmethod
+    def quality_process_signature(run: dict) -> str:
+        """Pin identity plus *all* resolved profiles, not a material/profile name.
+
+        This is provenance, not a test result. Per-project override equivalence and
+        physical representative equivalence still require current evidence.
+        """
+        roles = {"machine-profile", "filament-profile", "process-profile"}
+        return stable_hash({"profile": run["profile"], "resolved_profiles": {
+            key: value for key, value in run["artifacts"].items() if value["role"] in roles}})
+
+    @staticmethod
+    def purpose_errors(run: dict) -> list[str]:
+        if run.get("purpose") == "prototype":
+            return ["prototype purpose is historical-only; product parts require production"]
+        return []
+
+    def calibration_scope_errors(self, run: dict, row: dict | None = None) -> list[str]:
+        """Require the existing bounded-coupon schema independently of face strategy.
+
+        Intake may precede coupon geometry. Design and later gates call this
+        explicitly; quality marks also check the same scope and evidence links.
+        Shape/experimental suitability still require actual independent review.
+        """
+        quality = run.get("manufacturing_quality")
+        scope = quality.get("calibration_scope") if isinstance(quality, dict) else None
+        members = scope.get("part_ids") if isinstance(scope, dict) else None
+        if (run.get("purpose") != "calibration" or not isinstance(scope, dict)
+                or scope.get("kind") != "surface-coupon" or scope.get("full_product_part") is not False
+                or not isinstance(members, list) or not all(isinstance(p, str) for p in members)
+                or len(members) != len(set(members)) or set(members) != set(run["parts"])
+                or not all(text_present(scope.get(k), 12) for k in ("hypothesis", "limits", "acceptance"))):
+            return ["Calibration requires a bounded surface-coupon scope; full product parts are forbidden"]
+        errors, required_refs = [], set()
+        for field, role in (("evidence", "evidence"), ("geometry_evidence", "geometry")):
+            proof = scope.get(field)
+            ref = proof.get("artifact") if isinstance(proof, dict) else None
+            artifact = run["artifacts"].get(ref) if isinstance(ref, str) else None
+            label = f"bounded coupon {field}"
+            if artifact is None or artifact.get("role") != role:
+                errors.append(f"{label}: bound {role} artifact required")
+                continue
+            required_refs.add(ref)
+            if proof.get("sha256") != artifact.get("sha256") or not text_present(proof.get("locator")):
+                errors.append(f"{label}: current evidence hash and feature locator required")
+            try:
+                path = self.local_path(artifact["path"])
+                if not path.is_file() or digest(path) != artifact["sha256"]:
+                    errors.append(f"{label}: missing or changed current file")
+            except (OSError, KeyError, ValueError) as exc:
+                errors.append(f"{label}: {exc}")
+        if row is not None:
+            refs = row.get("evidence")
+            cited = {r.get("artifact") for r in refs if isinstance(r, dict)
+                     and isinstance(r.get("artifact"), str)} if isinstance(refs, list) else set()
+            if required_refs - cited:
+                errors.append("Calibration quality check must cite bounded coupon scope and geometry evidence: "
+                              + ", ".join(sorted(required_refs - cited)))
+        return errors
+
+    def quality_errors(self, run: dict, check_id: str, target: str, row: dict) -> list[str]:
+        """Fail closed on missing per-face/per-edge/per-support observations.
+
+        The validator cannot invent or certify physical observations. It makes
+        unknown quality, omitted feature groups and name-only profile claims
+        explicit blockers instead of accepting another free-form PASS.
+        """
+        quality = run.get("manufacturing_quality")
+        if not isinstance(quality, dict) or quality.get("schema_version") != 1:
+            return ["manufacturing_quality schema_version 1 and explicit feature inventories required"]
+        if not all(isinstance(quality.get(k), dict) for k in ("parts", "plates")):
+            return ["manufacturing_quality parts and plates must be explicit objects"]
+        if any(set(quality[k]) != set(run[k]) for k in ("parts", "plates")):
+            return ["manufacturing_quality must inventory every declared part and plate without extras"]
+        errors, required_refs = [], set()
+        artifacts = run["artifacts"]
+
+        def proof(value: Any, label: str, role: str = "evidence") -> None:
+            if not isinstance(value, dict):
+                errors.append(f"{label}: bound {role} evidence with hash and locator required")
+                return
+            ref = value.get("artifact")
+            item = artifacts.get(ref) if isinstance(ref, str) else None
+            if item is None or item.get("role") != role:
+                errors.append(f"{label}: bound {role} artifact required")
+                return
+            required_refs.add(ref)
+            if value.get("sha256") != item["sha256"] or not text_present(value.get("locator")):
+                errors.append(f"{label}: current evidence hash and feature/layer locator required")
+
+        def observation(value: Any, label: str) -> None:
+            if (not isinstance(value, dict) or value.get("result") != "accepted"
+                    or not text_present(value.get("observation"), 12)):
+                errors.append(f"{label}: accepted, specific actual observation required; unknown blocks")
+                return
+            proof(value.get("evidence"), label)
+
+        def number(value: Any, minimum: float = 0) -> bool:
+            return type(value) in (int, float) and math.isfinite(value) and value >= minimum
+
+        def inventory(value: Any, label: str, allow_empty: bool = False) -> list[dict]:
+            if not isinstance(value, list) or (not value and not allow_empty):
+                errors.append(f"{label}: explicit {'possibly empty' if allow_empty else 'nonempty'} inventory required")
+                return []
+            ids, records = set(), []
+            for item in value:
+                if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                        or not ID_RE.fullmatch(item["id"]) or item["id"] in ids):
+                    errors.append(f"{label}: unique feature IDs and object records required")
+                    continue
+                ids.add(item["id"])
+                records.append(item)
+            return records
+
+        if run["purpose"] == "calibration":
+            errors.extend(self.calibration_scope_errors(run, row))
+
+        scope, key = target.split(":", 1)
+        collection = quality.get(scope + "s")
+        subject = collection.get(key) if isinstance(collection, dict) else None
+        if not isinstance(subject, dict):
+            return [f"manufacturing_quality: complete {target} inventory required"]
+        proof(subject.get("inventory_evidence"), f"{target} exhaustive feature inventory")
+        # The structured observations must be traced to the reviewed geometry and,
+        # for slice checks, the *actual* project and toolpaths on every relevant
+        # plate. A report that cites only another report is not enough.
+        if scope == "part":
+            required_refs.update(ref for ref in run["parts"][key]["artifacts"]
+                                 if artifacts[ref]["role"] == "geometry")
+        relevant_plates = ([key] if scope == "plate" else
+                           [p for p, value in run["plates"].items() if key in value["parts"]])
+        if check_id != "surface-quality-strategy":
+            for plate_id in relevant_plates:
+                required_refs.update(ref for ref in run["plates"][plate_id]["artifacts"]
+                                     if artifacts[ref]["role"] in ("project", "gcode"))
+            required_refs.update(ref for ref, value in artifacts.items()
+                                 if value["role"] in ("machine-profile", "filament-profile", "process-profile"))
+
+        def current_inputs(label: str) -> None:
+            if scope != "part" or not any(artifacts[ref]["role"] == "geometry"
+                                           for ref in run["parts"][key]["artifacts"]):
+                errors.append(f"{label}: current part geometry required")
+            if check_id == "surface-quality-strategy":
+                return
+            if not relevant_plates or any(
+                    not {"project", "gcode"} <= {artifacts[ref]["role"] for ref in run["plates"][p]["artifacts"]}
+                    for p in relevant_plates):
+                errors.append(f"{label}: actual project and job required for every relevant plate")
+            if not {"machine-profile", "filament-profile", "process-profile"} <= {
+                    value["role"] for value in artifacts.values()}:
+                errors.append(f"{label}: all current resolved manufacturing profiles required")
+
+        if check_id == "native-support-stability":
+            groups = inventory(subject.get("support_groups"), "native support groups", allow_empty=True)
+            if type(subject.get("has_supports")) is not bool:
+                errors.append("native supports: explicit has_supports boolean required")
+            elif not subject["has_supports"]:
+                if groups or row.get("status") != "N/A":
+                    errors.append("native supports absent: empty groups and evidenced N/A required")
+            else:
+                if not groups or row.get("status") != "PASS":
+                    errors.append("native supports present: all groups and PASS assessment required")
+            covered = set()
+            def supported_ids(part_id: str) -> set[str]:
+                part = quality["parts"].get(part_id)
+                surfaces = part.get("surfaces") if isinstance(part, dict) else None
+                return {s["id"] for s in surfaces if isinstance(s, dict)
+                        and s.get("formation") == "native-support" and isinstance(s.get("id"), str)} if isinstance(surfaces, list) else set()
+            for group in groups:
+                part_id, surface_ids = group.get("part_id"), group.get("surface_ids")
+                known = supported_ids(part_id) if isinstance(part_id, str) else set()
+                if (part_id not in run["plates"][key]["parts"] or not isinstance(surface_ids, list)
+                        or not surface_ids or not all(isinstance(s, str) and s in known for s in surface_ids)
+                        or len(set(surface_ids)) != len(surface_ids)):
+                    errors.append(f"support {group['id']}: exact plate part and supported surface IDs required")
+                else:
+                    covered.update((part_id, sid) for sid in surface_ids)
+                for field in ("root_stability", "interface_coverage", "model_edge_curl", "nozzle_collision", "removal_access"):
+                    observation(group.get(field), f"support {group['id']} {field}")
+            expected = {(p, sid) for p in run["plates"][key]["parts"] for sid in supported_ids(p)}
+            if covered != expected:
+                errors.append("native supports: every supported model face must map to inspected root/interface/curl/collision groups")
+        elif check_id == "free-edge-continuity":
+            edges = inventory(subject.get("edges"), "free/functional edge inventory", allow_empty=True)
+            if not edges and not text_present(subject.get("no_edges_reason"), 12):
+                errors.append("edge inventory empty: explicit geometry-backed no-free-or-functional-edges reason required")
+            edge_index = {edge["id"]: edge for edge in edges}
+            current_roles = {"geometry", "project", "gcode", "machine-profile",
+                             "filament-profile", "process-profile"}
+            current_refs = {ref for ref in required_refs if artifacts[ref]["role"] in current_roles}
+            checked_files = set()
+
+            def current_proof(value: Any, label: str, role: str = "evidence") -> None:
+                proof(value, label, role)
+                ref = value.get("artifact") if isinstance(value, dict) else None
+                item = artifacts.get(ref) if isinstance(ref, str) else None
+                if item is None or ref in checked_files:
+                    return
+                checked_files.add(ref)
+                try:
+                    path = self.local_path(item["path"])
+                    if not path.is_file() or digest(path) != item["sha256"]:
+                        errors.append(f"{label}: missing or changed current file")
+                except (OSError, KeyError, ValueError, TypeError) as exc:
+                    errors.append(f"{label}: invalid current file: {exc}")
+
+            def ids(value: Any) -> set[str] | None:
+                if (not isinstance(value, list) or not value
+                        or not all(isinstance(v, str) and ID_RE.fullmatch(v) for v in value)
+                        or len(set(value)) != len(value)):
+                    return None
+                return set(value)
+
+            def justified_section(edge: dict) -> bool:
+                if "section_justification" not in edge:
+                    return False
+                label = f"edge {edge['id']} section justification"
+                before = len(errors)
+                justification = edge["section_justification"]
+                current_inputs(label)
+                for field in ("requirement_basis", "actual_section_formation"):
+                    observation(justification.get(field) if isinstance(justification, dict) else None,
+                                label + " " + field)
+                kind = edge.get("kind")
+                for field, applicable in (("min_roads", kind in ("vertical-web", "mixed")),
+                                          ("min_layers", kind in ("horizontal-skin", "mixed"))):
+                    value = edge.get(field)
+                    if (applicable or value is not None) and (type(value) is not int or value < 1):
+                        errors.append(f"{label}: honest positive actual {field} required where applicable")
+                return len(errors) == before
+
+            def bulk_minima(edge: dict) -> tuple[bool, bool]:
+                """Classify applicability, never substitute shell count for a thin section.
+
+                The optional representation requires a current whole-edge record.
+                A true thin section inside that domain still enforces its minimum;
+                adjacent strict records cannot be replaced by another bulk claim.
+                Actual geometric truth remains the evidence reviewers' responsibility.
+                """
+                legacy = (edge.get("kind") in ("vertical-web", "mixed"),
+                          edge.get("kind") in ("horizontal-skin", "mixed"))
+                section = edge.get("section_scope")
+                if not isinstance(section, dict) or section.get("classification") != "integral-bulk-boundary":
+                    return legacy
+                label = f"edge {edge['id']} integral bulk scope"
+                before = len(errors)
+                domain = section.get("domain")
+                if not isinstance(domain, dict):
+                    errors.append(f"{label}: explicit entire actual edge domain required")
+                    domain = {}
+                bounds = domain.get("parameter_range")
+                if (scope != "part" or domain.get("part_id") != key
+                        or domain.get("edge_id") != edge["id"]
+                        or domain.get("coverage") != "entire-edge"
+                        or not isinstance(bounds, list) or len(bounds) != 2
+                        or not all(number(v) for v in bounds) or bounds != [0, 1]
+                        or type(domain.get("layer_start")) is not int
+                        or type(domain.get("layer_end")) is not int
+                        or domain.get("layer_start") != edge.get("layer_start")
+                        or domain.get("layer_end") != edge.get("layer_end")):
+                    errors.append(f"{label}: exact part/edge, full [0,1] parameter and entire layer domain required")
+                surfaces, adjacent = ids(domain.get("surface_ids")), ids(edge.get("adjacent_faces"))
+                known_surfaces = {s.get("id") for s in subject.get("surfaces", [])
+                                  if isinstance(s, dict) and isinstance(s.get("id"), str)} if isinstance(subject.get("surfaces"), list) else set()
+                features, edge_features = ids(domain.get("feature_ids")), ids(edge.get("feature_ids"))
+                if surfaces is None or surfaces != adjacent or not surfaces <= known_surfaces:
+                    errors.append(f"{label}: every exact adjacent surface ID required in current part inventory")
+                if features is None or features != edge_features:
+                    errors.append(f"{label}: full actual edge feature IDs required")
+                bindings = section.get("current_artifacts")
+                refs = [v.get("artifact") for v in bindings if isinstance(v, dict)] if isinstance(bindings, list) else []
+                if (not current_roles <= {artifacts[r]["role"] for r in current_refs}
+                        or not relevant_plates
+                        or any(not {"project", "gcode"} <= {artifacts[r]["role"] for r in run["plates"][p]["artifacts"]}
+                               for p in relevant_plates)
+                        or not isinstance(bindings, list) or len(refs) != len(bindings)
+                        or not all(isinstance(r, str) for r in refs)
+                        or len(set(refs)) != len(refs) or set(refs) != current_refs):
+                    errors.append(f"{label}: exact complete current geometry/project/gcode/resolved-profile bindings required")
+                if isinstance(bindings, list):
+                    for value in bindings:
+                        ref = value.get("artifact") if isinstance(value, dict) else None
+                        if isinstance(ref, str) and ref in current_refs:
+                            current_proof(value, label + " current source", artifacts[ref]["role"])
+                bulk_evidence = section.get("bulk_evidence")
+                if not isinstance(bulk_evidence, list) or not bulk_evidence:
+                    errors.append(f"{label}: current full-section shape/skin-road/core evidence required")
+                else:
+                    for value in bulk_evidence:
+                        current_proof(value, label + " section evidence")
+                def accepted(field: str, value: Any) -> None:
+                    if (not isinstance(value, dict) or value.get("result") != "accepted"
+                            or not text_present(value.get("observation"), 12)):
+                        errors.append(f"{label} {field}: accepted full-domain observation required; boolean is insufficient")
+                    else:
+                        current_proof(value.get("evidence"), label + " " + field)
+                for field in ("not_standalone_sheet", "integral_parent_connection",
+                              "not_loaded_thin_roof", "full_domain_inventory"):
+                    accepted(field, section.get(field))
+                minima = section.get("applicable_minima")
+                if (not isinstance(minima, dict)
+                        or set(minima) != {"thin_roads_required", "thin_layers_required"}
+                        or any(type(minima.get(k)) is not bool for k in minima)):
+                    errors.append(f"{label}: two explicit evidence-backed applicable minima required")
+                    minima = {"thin_roads_required": True, "thin_layers_required": True}
+                roads, layers = minima["thin_roads_required"], minima["thin_layers_required"]
+                absence = section.get("thin_section_absence")
+                absent_axes = {axis for axis, needed in (("vertical", roads), ("horizontal", layers)) if not needed}
+                if not isinstance(absence, dict) or set(absence) != absent_axes:
+                    errors.append(f"{label}: exact accepted absence observations required only for nonapplicable thin axes")
+                else:
+                    for axis in sorted(absent_axes):
+                        accepted("no actual thin " + axis + " section", absence[axis])
+                thin_refs = section.get("thin_feature_inventory")
+                if not isinstance(thin_refs, list):
+                    errors.append(f"{label}: explicit complete adjoining/in-domain strict thin inventory required")
+                    thin_refs = []
+                seen = set()
+                for ref in thin_refs:
+                    ident = ref.get("edge_id") if isinstance(ref, dict) else None
+                    relation = ref.get("relationship") if isinstance(ref, dict) else None
+                    other = edge_index.get(ident) if isinstance(ident, str) else None
+                    if (other is None or ident == edge["id"] or ident in seen
+                            or relation not in ("within-domain", "adjoining-outside-domain")):
+                        errors.append(f"{label}: existing distinct unique strict thin edge and explicit domain relationship required")
+                        continue
+                    seen.add(ident)
+                    other_scope = other.get("section_scope")
+                    if isinstance(other_scope, dict) and other_scope.get("classification") == "integral-bulk-boundary":
+                        errors.append(f"{label}: thin reference must be strict, never self/cyclic/bulk-only")
+                        continue
+                    other_kind = other.get("kind")
+                    needs_roads = other_kind in ("vertical-web", "mixed")
+                    needs_layers = other_kind in ("horizontal-skin", "mixed")
+                    justified = justified_section(other)
+                    if (other_kind not in ("vertical-web", "horizontal-skin", "mixed")
+                            or (not justified and (
+                                (needs_roads and (type(other.get("min_roads")) is not int or other["min_roads"] < 3))
+                                or (needs_layers and (type(other.get("min_layers")) is not int or other["min_layers"] < 4))))):
+                        errors.append(f"{label}: referenced true thin feature needs a purpose-justified actual section or strict 3-road/4-layer minima")
+                    if relation == "within-domain" and ((needs_roads and not roads) or (needs_layers and not layers)):
+                        errors.append(f"{label}: mixed thin/bulk domain cannot suppress an in-domain thin minimum")
+                    current_proof(other.get("evidence"), label + " strict thin record")
+                    current_proof(ref.get("evidence"), label + " thin inventory relationship")
+                if ("min_roads" not in edge or type(edge["min_roads"]) is not int or edge["min_roads"] < 1
+                        or "min_layers" not in edge or (edge["min_layers"] is not None
+                        and (type(edge["min_layers"]) is not int or edge["min_layers"] < 1))):
+                    errors.append(f"{label}: honest positive actual skin-road and layer counts (or nonapplicable layers null) required")
+                return (roads, layers) if len(errors) == before else legacy
+
+            for edge in edges:
+                label = f"edge {edge['id']}"
+                kind = edge.get("kind")
+                if kind not in ("vertical-web", "horizontal-skin", "mixed"):
+                    errors.append(f"{label}: vertical-web/horizontal-skin/mixed kind required")
+                if (type(edge.get("layer_start")) is not int or type(edge.get("layer_end")) is not int
+                        or edge["layer_start"] < 1 or edge["layer_end"] < edge["layer_start"]):
+                    errors.append(f"{label}: exact positive start/end layers required")
+                roads_required, layers_required = bulk_minima(edge)
+                justified = justified_section(edge)
+                if not justified and roads_required and (type(edge.get("min_roads")) is not int or edge["min_roads"] < 3):
+                    errors.append(f"{label}: at least 3 actual contiguous roads required in every thin vertical section")
+                if not justified and layers_required and (type(edge.get("min_layers")) is not int or edge["min_layers"] < 4):
+                    errors.append(f"{label}: at least 4 actual continuous layers required in every thin horizontal section")
+                if edge.get("forming_base") not in ("model", "build-plate", "native-support"):
+                    errors.append(f"{label}: real forming base required")
+                for field in ("continuous", "seam_safe", "base_supported"):
+                    if edge.get(field) is not True:
+                        errors.append(f"{label}: {field} must be demonstrated true across exact layer ranges")
+                if not text_present(edge.get("observation"), 12):
+                    errors.append(f"{label}: actual contour/base/seam observation required")
+                proof(edge.get("evidence"), label)
+        else:
+            surfaces = inventory(subject.get("surfaces"), "surface inventory")
+            supported = [s for s in surfaces if s.get("formation") in ("native-support", "bridge")]
+            if check_id == "supported-surface-quality":
+                if not supported and row.get("status") != "N/A":
+                    errors.append("No supported or bridge faces: explicit inventory-backed N/A required")
+                elif supported and row.get("status") != "PASS":
+                    errors.append("Supported faces present: N/A forbidden")
+            for surface in surfaces:
+                label = f"surface {surface['id']}"
+                cls, formation, strategy = surface.get("class"), surface.get("formation"), surface.get("strategy")
+                if cls not in ("functional", "cosmetic", "noncritical"):
+                    errors.append(f"{label}: explicit functional/cosmetic/noncritical class required")
+                if formation not in ("build-plate", "self-supporting", "bridge", "native-support"):
+                    errors.append(f"{label}: actual formation class required")
+                if not text_present(surface.get("acceptance"), 12):
+                    errors.append(f"{label}: purpose-specific finish/geometry acceptance required")
+                if cls == "noncritical" and not text_present(surface.get("noncritical_reason"), 12):
+                    errors.append(f"{label}: explicit engineering reason for noncritical classification required")
+                if not number(surface.get("area_mm2"), 0.000001) or not number(surface.get("max_span_mm")):
+                    errors.append(f"{label}: measured positive area and nonnegative free span required")
+                proof(surface.get("evidence"), label)
+                is_supported = formation in ("bridge", "native-support")
+                if is_supported and strategy not in ("engineering-justified", "assessed-noncritical",
+                                                       "physically-validated", "bounded-surface-calibration"):
+                    errors.append(f"{label}: supported/bridge surface needs engineering justification, physical validation or bounded coupon")
+                elif not is_supported and strategy not in ("direct-print", "assessed-noncritical", "physically-validated", "bounded-surface-calibration"):
+                    errors.append(f"{label}: explicit quality strategy required")
+                if is_supported and strategy in ("engineering-justified", "assessed-noncritical"):
+                    if strategy == "assessed-noncritical" and cls != "noncritical":
+                        errors.append(f"{label}: assessed-noncritical requires an actual noncritical classification")
+                    justification = surface.get("engineering_justification")
+                    current_inputs(label + " engineering justification")
+                    for field in ("requirement_basis", "geometry_process_basis", "acceptance_budget"):
+                        observation(justification.get(field) if isinstance(justification, dict) else None,
+                                    f"{label} engineering {field}")
+                    if check_id == "supported-surface-quality":
+                        observation(justification.get("toolpath_assessment") if isinstance(justification, dict) else None,
+                                    f"{label} engineering toolpath_assessment")
+                if strategy == "bounded-surface-calibration":
+                    if run["purpose"] != "calibration":
+                        errors.extend(self.calibration_scope_errors(run, row))
+                if check_id != "supported-surface-quality" or formation not in ("native-support", "bridge"):
+                    continue
+                sliced = surface.get("slice")
+                if (not isinstance(sliced, dict) or not all(number(sliced.get(f)) for f in
+                        ("first_model_z_mm", "unsupported_span_mm", "interface_gap_mm", "interface_pitch_mm"))
+                        or not all(text_present(sliced.get(f), 12) for f in ("anchoring", "line_direction", "edge_formation"))):
+                    errors.append(f"{label}: exact first-model layer/interface/span/anchoring/direction/edge-formation observations required")
+                else:
+                    proof(sliced.get("evidence"), f"{label} slice")
+                if strategy == "physically-validated":
+                    validation = surface.get("physical_validation")
+                    if not isinstance(validation, dict) or validation.get("source") != "physical-test" or validation.get("result") != "accepted":
+                        errors.append(f"{label}: actual accepted physical test required; profile names and virtual review are insufficient")
+                        continue
+                    if (not all(text_present(validation.get(f)) for f in ("test_actor", "sample_id", "observed_at"))
+                            or not text_present(validation.get("material_condition"), 12)):
+                        errors.append(f"{label}: actual test observer, sample identity, time and material condition required")
+                    if validation.get("process_signature") != self.quality_process_signature(run):
+                        errors.append(f"{label}: physical test must match exact material and all current resolved settings")
+                    if not all(any(a["role"] == role for a in artifacts.values()) for role in
+                               ("machine-profile", "filament-profile", "process-profile")):
+                        errors.append(f"{label}: complete resolved manufacturing profiles required")
+                    if validation.get("test_kind") not in ("actual-part", "representative-coupon") or not text_present(validation.get("equivalence"), 12):
+                        errors.append(f"{label}: physical geometry/orientation/span/edge equivalence required")
+                    proof(validation.get("geometry_evidence"), f"{label} physical geometry", "geometry")
+                    proof(validation.get("project_equivalence_evidence"), f"{label} current project overrides equivalence")
+                    criteria = validation.get("criteria")
+                    for criterion in ("surface-finish", "dimensional-integrity", "layer-bonding", "edge-curl", "removability"):
+                        observation(criteria.get(criterion) if isinstance(criteria, dict) else None,
+                                    f"{label} physical {criterion}")
+        row_refs = row.get("evidence")
+        linked = {ref.get("artifact") for ref in row_refs if isinstance(ref, dict)
+                  and isinstance(ref.get("artifact"), str)} if isinstance(row_refs, list) else set()
+        if required_refs - linked:
+            errors.append("manufacturing quality check must cite every structured evidence artifact: "
+                          + ", ".join(sorted(required_refs - linked)))
+        return errors
 
     def component_errors(self, run: dict, check_id: str, row: dict) -> list[str]:
         """Validate traceable review/approval records, never infer human authorization.
@@ -511,6 +975,8 @@ class Harness:
             errors.extend(f"{label}: {error}" for error in self.component_errors(run, c["id"], row))
         if c["id"] == "gcode-customization-audit":
             errors.extend(f"{label}: {error}" for error in self.gcode_errors(run, target, row))
+        if c["id"] in QUALITY_CHECKS:
+            errors.extend(f"{label}: {error}" for error in self.quality_errors(run, c["id"], target, row))
         if row.get("basis_sha256") != self.basis(run, c["stage"]):
             errors.append(f"{label}: stale review basis; repeat review against current files/policy")
         evidence = row.get("evidence")
@@ -535,6 +1001,9 @@ class Harness:
                   "scope": "Review completeness and current-file integrity; no physical certification"}
         if errors:
             return result
+        errors.extend(self.purpose_errors(run))
+        if run["purpose"] == "calibration" and STAGES.index(stage) >= 1:
+            errors.extend(self.calibration_scope_errors(run))
         self.policy()
         by_key = {}
         known = {c["id"]: c for c in self.catalog}
@@ -612,6 +1081,8 @@ class Harness:
 
     def create(self, run_id: str, parts: list[str], plates: list[str], material: str,
                purpose: str, owner: str = "main-session", product: str | None = None) -> dict:
+        if purpose not in PURPOSES:
+            raise HarnessError("New runs require purpose production or calibration; prototype is historical-only")
         if (not parts or not plates or len(parts) != len(set(parts)) or len(plates) != len(set(plates))
                 or not all(ID_RE.fullmatch(x) for x in [run_id, *parts, *plates])):
             raise HarnessError("Explicit unique IDs required for run, parts and plates")
@@ -626,6 +1097,12 @@ class Harness:
                                         "manufacturer": "Bambu Lab" if material == "bambu-petg-basic" else "unknown",
                                         "product": "Bambu PETG Basic" if material == "bambu-petg-basic"
                                         else product or "PETG (unbranded; identity to verify)"}},
+               "manufacturing_quality": {
+                   "schema_version": 1, "calibration_scope": None,
+                   "parts": {p: {"inventory_evidence": None, "surfaces": [], "edges": [],
+                                 "no_edges_reason": ""} for p in parts},
+                   "plates": {p: {"inventory_evidence": None, "has_supports": None,
+                                  "support_groups": []} for p in plates}},
                "artifacts": {}, "parts": {p: {"artifacts": []} for p in parts},
                "plates": {p: {"parts": parts[:] if len(plates) == 1 else [], "artifacts": [],
                                "gcode_review": {"customization": "unknown", "expected_e_mode": None,
@@ -659,6 +1136,8 @@ class Harness:
         structural = self.structural_errors(run)
         if structural:
             raise HarnessError("; ".join(structural))
+        if status in {"PASS", "N/A"} and (purpose_errors := self.purpose_errors(run)):
+            raise HarnessError("; ".join(purpose_errors))
         required = {(c["id"], t): c for c, t in self.required(run, "release")}
         c = required.get((check_id, target))
         if c is None or status not in STATUSES:
@@ -720,7 +1199,7 @@ class Harness:
                     lines += [f"- [ ] **{c['id']}** ({c['scope']}): {c['title']}",
                               f"  {c['requirement']}",
                               f"  N/A: {'только с доказательством неприменимости' if c['na_allowed'] else 'запрещено'}.", ""]
-        return "\n".join(lines) + "\n"
+        return "\n".join(lines).rstrip("\n") + "\n"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -731,7 +1210,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--part", action="append", required=True)
     p.add_argument("--plate", action="append", required=True)
     p.add_argument("--material", choices=("bambu-petg-basic", "other-petg"), required=True)
-    p.add_argument("--purpose", choices=("production", "prototype", "calibration"), required=True)
+    p.add_argument("--purpose", choices=PURPOSES, required=True)
     p.add_argument("--owner", default="main-session")
     p.add_argument("--product")
     p = sub.add_parser("bind", help="Record existing file bytes, invalidating affected reviews")
